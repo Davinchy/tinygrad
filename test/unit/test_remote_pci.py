@@ -235,5 +235,51 @@ class TestRemotePCI(unittest.TestCase):
     self.assertEqual(ring[3], 0x1000000000 + (0x10003 << 42))
     self.assertEqual(ring[2], 0)
 
+  def test_submit_lowering(self):
+    # NVQueue.submit's own store graph lowered by pm_apl_lower, linked, compiled and run against the mock: the exact host path of a batch
+    import types
+    from unittest.mock import patch as mock_patch
+    import tinygrad.runtime.ops_nv as ops_nv
+    from tinygrad.runtime.ops_nv import NVDevice, NVQueue, GPFifo, pm_apl_lower
+    from tinygrad.runtime.support.hcq2 import lower_call, hcq_link, HCQInfo, to_name
+    from tinygrad.engine.realize import lower_and_compile, run_linear
+    from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, KernelInfo
+    from tinygrad.device import Device, BufferStorage
+    entries, ring_off, put0, token = 0x100, 0x2000, 0x1fe, 0x40001234 # a put that wraps: entry 0xfe, then gpput 0xff
+    bar1 = self.dev.map_bar(1)
+    ring = Buffer("CPU", entries, dtypes.uint64, opaque=BufferStorage(0, host=bar1.view(ring_off, entries * 8)))
+    gpput = Buffer("CPU", 1, dtypes.uint32, opaque=BufferStorage(0, host=bar1.view(ring_off + entries * 8 + 0x8c, 4)))
+    doorbell = Buffer("CPU", 1, dtypes.uint32, options=BufferSpec(external_ptr=self.dev.map_bar(0, fmt='I', off=0x10000, size=0x10000).addr + 0x90),
+                      preallocate=True) # a fake address, as in _new_gpu_fifo: the program must never store through it
+    put = Buffer("CPU", 1, dtypes.uint64, initial_value=struct.pack('<Q', put0))
+    cmdbuf = Buffer("CPU", 256, dtypes.uint8, preallocate=True)
+    fifo = GPFifo(ring=ring, gpput=gpput, doorbell=doorbell, put_value=put, notifier=None, entries=entries, token=token)
+    fake = NVDevice.__new__(NVDevice)
+    fake.fifos, fake.iface = {"COMPUTE:0": fifo}, types.SimpleNamespace(pci_dev=self.dev)
+
+    cpu, orig_buf, orig_lower = Device["CPU"], Device["CPU"].pm_bufferize, Device["CPU"].pm_lower
+    bufs = (("ring", ring), ("gpput", gpput), ("doorbell", doorbell), ("put_value", put), ("cmdbuf", cmdbuf))
+    binds = {to_name(n, "COMPUTE:0"): b for n, b in bufs}
+    cpu.pm_bufferize = PatternMatcher([(UPat(Ops.PARAM, name="b"), lambda ctx, b, binds=binds: binds.get(b.tag))]) + orig_buf
+    cpu.pm_lower = pm_apl_lower
+    self.addCleanup(setattr, cpu, "pm_bufferize", orig_buf)
+    self.addCleanup(setattr, cpu, "pm_lower", orig_lower)
+
+    hq = NVQueue.__new__(NVQueue)
+    hq.dev, hq.devs, hq.queue = fake, ("CPU",), "COMPUTE:0"
+    cmd = UOp.placeholder((256,), dtypes.uint8, device=("CPU",), tag=to_name("cmdbuf", "COMPUTE:0"))
+    call = UOp.sink(hq.submit(cmd), arg=KernelInfo("apl_submit")).call(aux=HCQInfo(("CPU",)))
+    with mock_patch.object(ops_nv, "Device", {"CPU": fake}): # apl_store finds the fifos on the device of the batch
+      linear = lower_and_compile(UOp(Ops.LINEAR, src=(unwrap(lower_call(call)),)))
+    run_linear(hcq_link(linear, allow_cache=False), jit=True, update_stats=False, wait=True)
+
+    ring_view = bar1.view(ring_off, entries * 8, fmt='Q')
+    self.assertEqual(ring_view[put0 % entries], cmdbuf._buf | (256 // 4 << 42) | (1 << 41))
+    self.assertEqual(ring_view[(put0 % entries) - 1], 0)
+    self.assertEqual(bar1.view(ring_off + entries * 8 + 0x8c, 4, fmt='I')[0], (put0 + 1) % entries)
+    self.assertEqual(self.dev.map_bar(0, fmt='I')[(0x10000 + 0x90) // 4], token)
+    self.assertEqual(put.host.view(fmt='Q')[0], put0 + 1)
+    self.assertEqual([op for op in self.server.ops if op == RemoteCmd.MMIO_WRITE], [RemoteCmd.MMIO_WRITE] * 3) # ring, gpput, doorbell, nothing else
+
 if __name__ == "__main__":
   unittest.main()

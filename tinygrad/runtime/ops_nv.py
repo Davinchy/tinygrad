@@ -211,8 +211,8 @@ def apl_store(ctx:EncodeCtx, b:UOp, idx:UOp, v:UOp) -> UOp|None:
   host, pd, n = getattr(dev.fifos[hit[0]], hit[1]).host, dev.iface.pci_dev, v.dtype.itemsize
   bar, base = (host.residx if isinstance(host, RemoteMMIOInterface) else 0), host.addr + unwrap_view(b)[1] # the doorbell is a bar 0 offset
   hdr = struct.pack(REMOTE_REQ, RemoteCmd.MMIO_WRITE, pd.dev_id, bar, base, n, 0)
-  pkt = UOp.placeholder((len(hdr) + n,), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, volatile=True, tag=f"apl_{p.tag}")
-  pkt = patch(pkt.after(*apl_deps(b)), [(9, idx.cast(dtypes.uint64) * n + base), (len(hdr), v)], hdr) # arg0 is the byte offset, then the payload
+  pkt = patch(UOp.placeholder((len(hdr) + n,), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, volatile=True, tag=f"apl_{p.tag}"), [], hdr) # at link
+  pkt = patch(pkt.after(*apl_deps(b)), [(9, idx.cast(dtypes.uint64) * n + base), (len(hdr), v)]) # at run: arg0 is the byte offset, then the payload
   return ccall(libc.write, pd.sock.fileno(), pkt.index(0), UOp.const(len(hdr) + n, dtypes.uint64))
 pm_apl_lower = PatternMatcher([(UPat.var("b").index(UPat.var("idx")).store(UPat.var("v")), apl_store)])
 
