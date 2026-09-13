@@ -14,7 +14,7 @@ from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, pr
 from tinygrad.helpers import ProfileEvent, unwrap
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
-from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa, pci, libc
+from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa, libc
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
 from tinygrad.runtime.support.system import PCIIfaceBase, MAP_FIXED, RemoteCmd, RemoteMMIOInterface, REMOTE_REQ
@@ -542,6 +542,7 @@ class NVKIface:
     return NVKIface.low_uvm_vaddr_allocator.alloc(size, alignment) if force_low else NVKIface.uvm_vaddr_allocator.alloc(size, alignment)
 
   def is_local(self) -> bool: return True
+  def quiesce(self): pass # the kernel driver owns the device
   def sleep(self, tm:int): pass
 
 class PCIIface(PCIIfaceBase):
@@ -565,13 +566,13 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
+  def quiesce(self): self.pci_dev.quiesce()
+
   def device_fini(self):
     try:
       # unloading gsp poisons the next boot of a blackwell over thunderbolt (tinygrad#16454): a remote keeps it resident by default
       if not getenv("NV_KEEP_GSP", 0 if self.is_local() else 1): self.dev_impl.fini()
-    finally: # the remote drops the dma mappings when the socket closes, so the device must stop writing to them first
-      if not self.is_local():
-        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+    finally: self.quiesce() # the remote drops the dma mappings when the socket closes, so the device must stop writing to them first
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
@@ -592,6 +593,13 @@ class NVDevice(Compiled):
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
+    try: self._bringup(device)
+    except Exception:
+      self.iface.quiesce() # the gpu is booted and mastering the bus, and no finalizer runs for a device that never finished opening
+      raise
+
+  def _bringup(self, device:str):
+    # NOTE: nothing here may touch a buffer or Device[...]: this device is not registered yet, so that would build a second one on the same gpu
     if not self.iface.is_local(): self.pm_lower = pm_apl_lower # the submit program writes the bars through the remote
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
@@ -632,7 +640,6 @@ class NVDevice(Compiled):
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
 
     self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
-    if not self.iface.is_local(): self.fifos # the gpfifo area must stay inside the bar window: allocate it before any tensor takes the low vram
 
   @functools.cached_property
   def host_staging(self) -> Buffer|None: # a remote cannot map the host allocator's pages: copies are staged through dma memory of its own

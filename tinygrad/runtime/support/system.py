@@ -230,6 +230,12 @@ class PCIDevice:
   def sysmem_paddrs(self, addr:int, size:int) -> list[int]: raise RuntimeError(f"{addr:#x} is not dma memory of {self.pcibus}")
   def free_sysmem(self, view:MMIOInterface): pass
 
+  def quiesce(self):
+    # stop the device mastering the bus. a half booted gpu keeps dma-ing into host memory (gsp queues, logs, the notifier) that the next
+    # teardown is about to unmap, which faults the iommu; nothing else clears it when bring-up raises before the device is ever opened.
+    with contextlib.suppress(Exception):
+      self.write_config_flush(pci.PCI_COMMAND, self.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+
 class USBPCIDevice(PCIDevice):
   def __init__(self, devpref:str, dev, pcibus):
     self.pcibus, self.peer_group = pcibus, f"USBPCIDevice_{pcibus}"
@@ -256,6 +262,8 @@ class USBPCIDevice(PCIDevice):
 class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=0 # noqa: E702
 
 class PCIIfaceBase:
+  bar_pool:tuple[int, BumpAllocator]|None = None # set by __init__; an iface that skips it (USBIface) keeps the plain allocation path
+
   @property
   def peer_group(self) -> str: return getattr(self.pci_dev, 'peer_group', type(self.pci_dev).__name__)
   def is_local(self) -> bool: return not isinstance(self.pci_dev, RemotePCIDevice)
@@ -264,10 +272,26 @@ class PCIIfaceBase:
   def __init__(self, dev, dev_id, vendor, devices:tuple[tuple[int, tuple[int, ...]], ...], vram_bar, va_start, va_size,
                dev_impl_t, base_class:int|None=None):
     self.pci_dev = System.pci_probe_device(dn:=dev.__class__.__name__[:-6], dev_id, vendor, devices, base_class=base_class)
-    if self.is_local(): System.reserve_va(va_start, va_size)
-    with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
-    self.dev_impl = dev_impl_t(self.pci_dev)
-    self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
+    try:
+      if self.is_local(): System.reserve_va(va_start, va_size)
+      with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
+      self.dev_impl = dev_impl_t(self.pci_dev)
+      self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
+      self.bar_pool = self._reserve_bar_pool()
+    except Exception:
+      self.pci_dev.quiesce()
+      raise
+
+  def _reserve_bar_pool(self) -> tuple[int, BumpAllocator]|None:
+    # on a small bar only the first bytes of vram are cpu visible, and the physical allocator hands out whatever is free, so a ring
+    # allocated after a model's weights lands outside the window and its writes go nowhere. reserve that memory before anything else runs.
+    if not self.is_bar_small(): return None
+    paddr = self.dev_impl.mm.palloc(size:=getenv("PCI_BAR_POOL", 4 << 20), zero=True)
+    if paddr + size > (bar_sz:=self.pci_dev.bar_info(self.vram_bar)[1]):
+      raise RuntimeError(f"cpu visible vram pool [{paddr:#x}, {paddr + size:#x}) does not fit the {bar_sz:#x} byte bar window")
+    return (paddr, BumpAllocator(size, base=paddr, wrap=False))
+
+  def in_bar_pool(self, paddr:int) -> bool: return self.bar_pool is not None and self.bar_pool[0] <= paddr < self.bar_pool[0] + self.bar_pool[1].size
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
             **kwargs) -> BufferStorage:
@@ -282,12 +306,20 @@ class PCIIfaceBase:
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
 
+    if cpu_access and force_devmem and self.bar_pool is not None: # has to be vram and has to be cpu visible: only the reserved window is both
+      paddr = self.bar_pool[1].alloc(size:=round_up(size, 0x1000), 0x1000)
+      mapping = self.dev_impl.mm.map_range(self.dev_impl.mm.alloc_vaddr(size), size, [(paddr, size)], aspace=AddrSpace.PHYS, uncached=uncached)
+      barview = self.pci_dev.map_bar(self.vram_bar, off=paddr, size=size)
+      return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, True, hMemory=paddr), barview)
+
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), barview)
 
   def free(self, storage:BufferStorage):
-    if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
+    # the reserved window is one physical block: its pages are never handed back to the physical allocator, only the mapping goes
+    if self.in_bar_pool(storage.meta.hMemory): self.dev_impl.mm.unmap_range(storage.meta.mapping.va_addr, storage.meta.mapping.size)
+    elif storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
     if storage.meta.has_cpu_mapping and self.is_local(): FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
     elif storage.meta.has_cpu_mapping: self.pci_dev.free_sysmem(unwrap(storage.host)) # no cpu mapping of ours to drop: the remote owns the pages
 

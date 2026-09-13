@@ -10,9 +10,10 @@ def resp(resp0=0, resp1=0, status=0): return struct.pack(REMOTE_RESP, status, re
 
 class MockTinyGPUServer(threading.Thread):
   """server.c in python: bars are bytearrays, config space is a bytearray, dma memory is a temp file whose fd is passed to the client"""
-  def __init__(self, path:str, bars:dict[int, int]|None=None, max_sysmem:int=128):
+  def __init__(self, path:str, bars:dict[int, int]|None=None, max_sysmem:int=128, report:dict[int, int]|None=None):
     super().__init__(daemon=True)
     self.path, self.bars = path, {i: bytearray(sz) for i, sz in (bars or {0: 0x20000, 1: 0x40000, 3: 0x10000}).items()}
+    self.report = report or {} # what MAP_BAR reports, for when the backing store is smaller than the real bar
     self.cfg, self.max_sysmem, self.sysmem, self.resets, self.ops = bytearray(4096), max_sysmem, [], 0, []
     self.cfg[0:4], self.cfg[4:6] = struct.pack('<HH', 0x10de, 0x2b85), struct.pack('<H', 0x0007)
     self.cfg[0x10:0x14], self.cfg[0x14:0x1c] = struct.pack('<I', 0xa0000000), struct.pack('<Q', 0x6000000004) # bar0 32 bit, bar1 64 bit
@@ -35,7 +36,8 @@ class MockTinyGPUServer(threading.Thread):
     while len(hdr:=conn.recv(struct.calcsize(REMOTE_REQ), socket.MSG_WAITALL)) == struct.calcsize(REMOTE_REQ):
       cmd, dev_id, bar, arg0, arg1, arg2 = struct.unpack(REMOTE_REQ, hdr)
       self.ops.append(cmd)
-      if cmd == RemoteCmd.MAP_BAR: conn.sendall(resp(0x100000000 + bar * 0x10000000, len(self.bars[bar])) if bar in self.bars else resp(status=1))
+      if cmd == RemoteCmd.MAP_BAR:
+        conn.sendall(resp(0x100000000 + bar * 0x10000000, self.report.get(bar, len(self.bars[bar]))) if bar in self.bars else resp(status=1))
       elif cmd == RemoteCmd.CFG_READ: conn.sendall(resp(int.from_bytes(self.cfg[arg0:arg0+arg1], 'little')))
       elif cmd == RemoteCmd.CFG_WRITE:
         self.cfg[arg0:arg0+arg1] = arg2.to_bytes(arg1, 'little')
@@ -71,7 +73,16 @@ class MockTinyGPUServer(threading.Thread):
 
 class FakeMM: # the memory manager side of PCIIfaceBase, records mappings
   va_base, va_bits = 0x1000000000, 44
-  def __init__(self): self.next_va, self.mapped, self.unmapped = self.va_base, [], []
+  PA_BASE = 50 << 20 # like a real pa_allocator: past the boot and page table regions
+  def __init__(self, pci_dev=None):
+    self.next_va, self.mapped, self.unmapped, self.freed = self.va_base, [], [], []
+    self.pci_dev, self.next_pa = pci_dev, self.PA_BASE
+  def palloc(self, size:int, align=0x1000, zero=True, boot=False, ptable=False) -> int:
+    paddr = self.next_pa = (self.next_pa + align - 1) // align * align
+    self.next_pa += size
+    if zero and self.pci_dev is not None: self.pci_dev.map_bar(1)[paddr:paddr+size] = bytes(size)
+    return paddr
+  def vfree(self, vm): self.freed.append((vm.va_addr, vm.size))
   def alloc_vaddr(self, size, align=0x1000):
     self.next_va = (self.next_va + align - 1) // align * align
     va, self.next_va = self.next_va, self.next_va + size
@@ -82,17 +93,25 @@ class FakeMM: # the memory manager side of PCIIfaceBase, records mappings
     return VirtMapping(vaddr, size, paddrs, aspace=aspace, uncached=uncached, snooped=snooped)
   def unmap_range(self, vaddr, size): self.unmapped.append((vaddr, size))
 
+class FakeNVDev: # what PCIIfaceBase builds as dev_impl_t: only the memory manager matters here
+  fail = False
+  def __init__(self, pci_dev):
+    if type(self).fail: raise RuntimeError("gsp boot failed")
+    self.pci_dev, self.mm = pci_dev, FakeMM(pci_dev)
+
+_shared:list = []
+def shared_server():
+  # getenv caches APL_REMOTE_SOCK for the life of the process, so every test class has to talk to the same server
+  if not _shared:
+    srv = MockTinyGPUServer(path:=os.path.join(tempfile.mkdtemp(), "tinygpu.sock"), bars={0: 0x20000, 1: 64 << 20, 3: 0x10000})
+    srv.start()
+    os.environ["APL_REMOTE_SOCK"] = path
+    _shared.append(srv)
+  return _shared[0]
+
 class TestRemotePCI(unittest.TestCase):
   @classmethod
-  def setUpClass(cls): # one server and one socket path for the process: getenv is cached
-    cls.server = MockTinyGPUServer(path:=os.path.join(tempfile.mkdtemp(), "tinygpu.sock"))
-    cls.server.start()
-    os.environ["APL_REMOTE_SOCK"] = path
-
-  @classmethod
-  def tearDownClass(cls):
-    cls.server.close()
-    del os.environ["APL_REMOTE_SOCK"]
+  def setUpClass(cls): cls.server = shared_server()
 
   def setUp(self):
     self.server.ops.clear()
@@ -112,11 +131,11 @@ class TestRemotePCI(unittest.TestCase):
     self.assertEqual(self.server.cfg[4:6], b"\x07\x00")
 
   def test_bar_info_and_cfg_base(self):
-    self.assertEqual(self.dev.bar_info(1), (0x110000000, 0x40000))
+    self.assertEqual(self.dev.bar_info(1), (0x110000000, 64 << 20))
     dev2 = APLRemotePCIDevice.__new__(APLRemotePCIDevice) # reuse the socket, bar_info is cached per instance
     dev2.__dict__.update(self.dev.__dict__)
     dev2.bar_from_cfg = True
-    self.assertEqual(dev2.bar_info(1), (0x6000000000, 0x40000))
+    self.assertEqual(dev2.bar_info(1), (0x6000000000, 64 << 20))
     self.assertEqual(dev2.bar_info(0)[0], 0xa0000000)
 
   def test_mmio(self):
@@ -166,6 +185,7 @@ class TestRemotePCI(unittest.TestCase):
   def test_iface_alloc_map_free(self):
     iface = PCIIfaceBase.__new__(PCIIfaceBase)
     iface.pci_dev, iface.dev_impl, iface.vram_bar, iface.dev = self.dev, type("Impl", (), {"mm": FakeMM()})(), 1, None
+    iface.bar_pool = None
     self.assertFalse(iface.is_local())
     self.assertFalse(iface.is_bar_small()) # the mock's bar1 is tiny
     st = iface.alloc(0x2000, host=True) # host allocations round to the host page size (16 KB on apple silicon)
@@ -283,3 +303,58 @@ class TestRemotePCI(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+class TestBringup(unittest.TestCase):
+  """the two failures that left the real gpu mastering the bus on 2026-09-13: a bring-up that raises, and a ring outside the bar window"""
+  @classmethod
+  def setUpClass(cls): cls.server = shared_server()
+
+  def setUp(self):
+    self.server.ops.clear()
+    self.server.report[1] = 256 << 20 # report the real 256 MB of a small-bar card, backing only the low 64 MB the test touches
+    self.addCleanup(self.server.report.pop, 1)
+    self.server.cfg[4:6] = struct.pack('<H', 0x0007) # io, memory and bus master on, as the dext leaves it at enumeration
+    self.dev = APLRemotePCIDevice("NV", "10de:2b85")
+    self.addCleanup(os.close, self.dev.lock_fd)
+    self.addCleanup(self.dev.sock.close)
+
+  def build(self, dev_impl_t):
+    from unittest.mock import patch as mock_patch
+    from tinygrad.runtime.support.system import System
+    dev = type("NVDevice", (), {})() # PCIIfaceBase reads the device name off the class
+    with mock_patch.object(System, "pci_probe_device", lambda *a, **k: self.dev), \
+         mock_patch.object(System, "list_devices", lambda *a, **k: [(APLRemotePCIDevice, "10de:2b85")]):
+      return PCIIfaceBase(dev, 0, 0x10de, ((0xff00, (0x2b00,)),), vram_bar=1, va_start=0, va_size=0, dev_impl_t=dev_impl_t, base_class=0x03)
+
+  def bus_master(self) -> bool: return bool(struct.unpack('<H', self.server.cfg[4:6])[0] & 0x4)
+
+  def test_failed_bringup_clears_bus_master(self):
+    # nothing finalizes a device that never finished opening, so the failure path itself has to stop the dma before the mappings go
+    FakeNVDev.fail = True
+    self.addCleanup(setattr, FakeNVDev, "fail", False)
+    self.assertTrue(self.bus_master())
+    with self.assertRaises(RuntimeError): self.build(FakeNVDev)
+    self.assertFalse(self.bus_master())
+
+  def test_ring_stays_in_the_bar_window(self):
+    iface = self.build(FakeNVDev)
+    self.assertIsNotNone(pool:=iface.bar_pool)
+    self.assertLess(pool[0] + pool[1].size, 256 << 20) # reserved at init, so it is inside the window whatever runs later
+    mm = iface.dev_impl.mm
+    mm.palloc(24 << 30, zero=False) # a model's weights: every later physical allocation is now far outside the window
+    st = iface.alloc(3 << 20, contiguous=True, cpu_access=True, force_devmem=True)
+    self.assertTrue(iface.in_bar_pool(st.meta.hMemory))
+    self.assertLess(st.meta.hMemory + (3 << 20), 256 << 20)
+    unwrap(st.host)[0:4] = b"ring" # a write the server accepts, rather than one it drops on the floor
+    self.assertEqual(bytes(unwrap(st.host)[0:4]), b"ring") # writes are posted: this read orders them before the check below
+    self.assertEqual(bytes(self.server.bars[1][st.meta.hMemory:st.meta.hMemory + 4]), b"ring")
+    iface.free(st) # the window is one physical block: only the mapping goes back
+    self.assertEqual(mm.freed, [])
+    self.assertEqual(mm.unmapped[-1], (st.meta.mapping.va_addr, st.meta.mapping.size))
+
+  def test_init_never_builds_buffers(self):
+    # Device[...] registers only after __init__ returns, so anything here that allocates a Buffer opens a second device on the same gpu
+    import inspect
+    from tinygrad.runtime.ops_nv import NVDevice
+    src = inspect.getsource(NVDevice.__init__) + inspect.getsource(NVDevice._bringup)
+    for forbidden in ("self.fifos", "Buffer("): self.assertNotIn(forbidden, src)
