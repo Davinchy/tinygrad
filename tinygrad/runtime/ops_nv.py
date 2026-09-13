@@ -4,7 +4,7 @@ assert sys.platform != 'win32'
 from typing import Any
 from dataclasses import dataclass, replace
 from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, patch, to_name, unwrap_view, make_submit, timeline, HCQInfo, lower_call, hcq_link
-from tinygrad.runtime.support.hcq2 import layout_args
+from tinygrad.runtime.support.hcq2 import layout_args, ccall, HCQ_RUNTIME_DEV, STAGING_SIZE, EncodeCtx
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, BumpAllocator, hcq_filter_visible_devices
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops, lower_and_compile, run_linear
@@ -14,10 +14,10 @@ from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, pr
 from tinygrad.helpers import ProfileEvent, unwrap
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
-from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
+from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa, pci, libc
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
-from tinygrad.runtime.support.system import PCIIfaceBase, MAP_FIXED
+from tinygrad.runtime.support.system import PCIIfaceBase, MAP_FIXED, RemoteCmd, RemoteMMIOInterface, REMOTE_REQ
 from tinygrad.renderer.nir import NAKRenderer
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: disable=unused-import
 
@@ -197,6 +197,24 @@ class NVCopyQueue(NVQueue):
     self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA, nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type=f"release_{typ}_word_semaphore"))
   def timestamp(self, signal:UOp): self.semaphore(signal.getaddr(self.devs), UOp.const(0, dtypes.uint32), "four")
   def signal(self, signal:UOp, value:UOp): self.semaphore(signal.getaddr(self.devs), value, "one")
+
+# *****************
+# remote pci (the macOS TinyGPU path): the bars are mapped in the server process, so the submit program cannot store into them. A store to a
+# fifo's ring, gpput or doorbell becomes one posted MMIO_WRITE packet written to the server socket, the bytes RemoteMMIOInterface would send
+
+def apl_deps(b:UOp) -> tuple[UOp, ...]: # dependencies through views
+  return (b.src[1:] if b.op is Ops.AFTER else ()) + (apl_deps(b.src[0]) if b.op in (Ops.BITCAST, Ops.SHRINK, Ops.AFTER) else ())
+
+def apl_store(ctx:EncodeCtx, b:UOp, idx:UOp, v:UOp) -> UOp|None:
+  if (p:=unwrap_view(b)[0]).op is not Ops.PARAM or not isinstance(p.tag, str) or not isinstance(dev:=Device[ctx.devs[0]], NVDevice): return None
+  if (hit:=next(((q, n) for q in dev.fifos for n in ("ring", "gpput", "doorbell") if to_name(n, q) == p.tag), None)) is None: return None
+  host, pd, n = getattr(dev.fifos[hit[0]], hit[1]).host, dev.iface.pci_dev, v.dtype.itemsize
+  bar, base = (host.residx if isinstance(host, RemoteMMIOInterface) else 0), host.addr + unwrap_view(b)[1] # the doorbell is a bar 0 offset
+  hdr = struct.pack(REMOTE_REQ, RemoteCmd.MMIO_WRITE, pd.dev_id, bar, base, n, 0)
+  pkt = UOp.placeholder((len(hdr) + n,), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, volatile=True, tag=f"apl_{p.tag}")
+  pkt = patch(pkt.after(*apl_deps(b)), [(9, idx.cast(dtypes.uint64) * n + base), (len(hdr), v)], hdr) # arg0 is the byte offset, then the payload
+  return ccall(libc.write, pd.sock.fileno(), pkt.index(0), UOp.const(len(hdr) + n, dtypes.uint64))
+pm_apl_lower = PatternMatcher([(UPat.var("b").index(UPat.var("idx")).store(UPat.var("v")), apl_store)])
 
 # *****************
 # programs
@@ -523,6 +541,7 @@ class NVKIface:
   def _alloc_gpu_vaddr(self, size, alignment=(4 << 10), force_low=False):
     return NVKIface.low_uvm_vaddr_allocator.alloc(size, alignment) if force_low else NVKIface.uvm_vaddr_allocator.alloc(size, alignment)
 
+  def is_local(self) -> bool: return True
   def sleep(self, tm:int): pass
 
 class PCIIface(PCIIfaceBase):
@@ -546,7 +565,12 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
-  def device_fini(self): self.dev_impl.fini()
+  def device_fini(self):
+    try:
+      if not getenv("NV_GSP_RESIDENT", 0): self.dev_impl.fini() # NV_GSP_RESIDENT=1 leaves gsp running for the next process
+    finally: # the remote drops the dma mappings when the socket closes, so the device must stop writing to them first
+      if not self.is_local():
+        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
@@ -567,6 +591,7 @@ class NVDevice(Compiled):
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
+    if not self.iface.is_local(): self.pm_lower = pm_apl_lower # the submit program writes the bars through the remote
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -606,6 +631,13 @@ class NVDevice(Compiled):
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
 
     self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
+    if not self.iface.is_local(): self.fifos # the gpfifo area must stay inside the bar window: allocate it before any tensor takes the low vram
+
+  @functools.cached_property
+  def host_staging(self) -> Buffer|None: # a remote cannot map the host allocator's pages: copies are staged through dma memory of its own
+    if self.iface.is_local(): return None
+    view, _ = self.iface.pci_dev.alloc_sysmem(STAGING_SIZE)
+    return Buffer("CPU", STAGING_SIZE, dtypes.uint8, options=BufferSpec(external_ptr=view.addr), preallocate=True)
 
   @functools.cached_property
   def fifos(self) -> dict[str, GPFifo]:

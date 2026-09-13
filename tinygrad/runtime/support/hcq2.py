@@ -86,7 +86,7 @@ def cfunc_buf(lib:str, name:str) -> Buffer:
 def ccall(fn:Any, *args:UOp|int) -> UOp:
   ptr = UOp.placeholder((1,), dtypes.uint64, 0, device=HCQ_RUNTIME_DEV.value, tag=("cfunc", fn.__module__.split(".")[-1], fn.__name__))
   ret = dtypes.void if fn.restype is None else dtypes.uint64 if fn.restype is ctypes.c_void_p else \
-    next(d for d in DTYPES_DICT.values() if d.fmt == fn.restype._type_)
+    next(d for d in DTYPES_DICT.values() if d.fmt == {'l': 'q', 'L': 'Q'}.get(fn.restype._type_, fn.restype._type_)) # c_long is 64 bit on lp64
   cargs = [UOp.const(a, dtypes.int) if isinstance(a, int) else a for a in args]
   return UOp.custom_function(fn.__name__, ptr.index(0).load()).call(*cargs, ret_dtype=ret)
 
@@ -133,8 +133,9 @@ def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
   except (RuntimeError, OSError):
-    _staging().get_buf(device)
-    base, it, copies = UOp.from_buffer(_staging()), src.dtype.itemsize, []
+    staging = getattr(Device[to_tuple(device)[0]], "host_staging", None) or _staging() # a device may stage through memory of its own
+    staging.get_buf(device)
+    base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
     chunk = (STAGING_SIZE // STAGING_SLOTS) // it
     for i, off in enumerate(range(0, src.max_numel(), chunk)):
       stage = base[(so:=(i % STAGING_SLOTS) * chunk * it):so + (n:=min(chunk, src.max_numel() - off)) * it]
