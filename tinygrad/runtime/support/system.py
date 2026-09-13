@@ -331,9 +331,13 @@ class RemoteMMIOInterface(MMIOInterface):
     self.dev, self.residx, self.nbytes, self.fmt, self.off, self.el_sz = dev, residx, nbytes, fmt, off, struct.calcsize(fmt)
     self.rd_cmd, self.wr_cmd, self.addr = rd_cmd, wr_cmd, off
 
+  def _range(self, start:int, stop:int) -> tuple[int, int]: # the server drops a write past the resource without a word: fail here instead
+    if not 0 <= start <= stop <= self.nbytes: raise IndexError(f"remote: [{start:#x}:{stop:#x}] is outside a view of {self.nbytes:#x} bytes")
+    return start, stop
+
   def __getitem__(self, index):
     sl = index if isinstance(index, slice) else slice(index, index + 1)
-    start, stop = (sl.start or 0) * self.el_sz, (sl.stop or len(self)) * self.el_sz
+    start, stop = self._range((sl.start or 0) * self.el_sz, (sl.stop or len(self)) * self.el_sz)
     data = self.dev._bulk_read(self.rd_cmd, self.residx, self.off + start, stop - start)
     result = data if self.fmt == 'B' else list(struct.unpack(f'<{(stop - start) // self.el_sz}{self.fmt}', data))
     return result if isinstance(index, slice) else result[0]
@@ -341,7 +345,7 @@ class RemoteMMIOInterface(MMIOInterface):
   def __setitem__(self, index, val):
     start = (index.start or 0) * self.el_sz if isinstance(index, slice) else index * self.el_sz
     data = (val if self.fmt == 'B' else struct.pack(f'<{len(val)}{self.fmt}', *val)) if isinstance(index, slice) else struct.pack(f'<{self.fmt}', val)
-    self.dev._bulk_write(self.wr_cmd, self.residx, self.off + start, bytes(data))
+    self.dev._bulk_write(self.wr_cmd, self.residx, self.off + self._range(start, start + len(data))[0], bytes(data))
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return RemoteMMIOInterface(self.dev, self.residx, size or (self.nbytes - offset), fmt or self.fmt, self.off + offset, self.rd_cmd, self.wr_cmd)

@@ -138,6 +138,9 @@ class TestRemotePCI(unittest.TestCase):
     self.assertEqual(bytes(raw[0:4]), b"abcd") # writes are posted: the read orders them before the check below
     self.assertEqual(bytes(self.server.bars[1][0x1000:0x1004]), b"abcd")
     self.assertEqual(self.dev.map_bar(0, fmt='I', off=0xbb0000, size=0x10000).addr + 0x90, 0xbb0090) # the doorbell's address
+    with self.assertRaises(IndexError): regs[len(regs)] = 1 # past the bar: the server would drop it silently
+    with self.assertRaises(IndexError): v[4:6] = [1, 2]
+    with self.assertRaises(IndexError): raw[0xf0:0x110]
 
   def test_sysmem(self):
     self.dev.chunk_size, n0 = 1 << 20, len(self.server.sysmem)
