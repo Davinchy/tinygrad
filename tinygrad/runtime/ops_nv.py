@@ -567,7 +567,7 @@ class PCIIface(PCIIfaceBase):
 
   def device_fini(self):
     try:
-      if not getenv("NV_GSP_RESIDENT", 0): self.dev_impl.fini() # NV_GSP_RESIDENT=1 leaves gsp running for the next process
+      if not getenv("NV_KEEP_GSP", 0): self.dev_impl.fini() # NV_KEEP_GSP=1 leaves gsp running for the next process
     finally: # the remote drops the dma mappings when the socket closes, so the device must stop writing to them first
       if not self.is_local():
         self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)

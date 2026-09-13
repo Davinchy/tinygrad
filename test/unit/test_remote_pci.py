@@ -4,7 +4,6 @@ from tinygrad.helpers import unwrap
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.support.system import RemoteCmd, REMOTE_REQ, REMOTE_RESP, APLRemotePCIDevice, RemoteMMIOInterface, PCIIfaceBase
 from tinygrad.runtime.support.hcq import MMIOInterface
-from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.device import Buffer, BufferSpec
 
 def resp(resp0=0, resp1=0, status=0): return struct.pack(REMOTE_RESP, status, resp0, resp1)
@@ -46,13 +45,15 @@ class MockTinyGPUServer(threading.Thread):
         conn.sendall(resp())
       elif cmd == RemoteCmd.RESIZE_BAR: conn.sendall(resp())
       elif cmd == RemoteCmd.MMIO_READ:
-        if bar not in self.bars or arg0 + arg1 > len(self.bars[bar]): conn.sendall(resp(status=1)); continue
-        conn.sendall(resp(arg1) + bytes(self.bars[bar][arg0:arg0+arg1]))
+        if bar not in self.bars or arg0 + arg1 > len(self.bars[bar]): conn.sendall(resp(status=1))
+        else: conn.sendall(resp(arg1) + bytes(self.bars[bar][arg0:arg0+arg1]))
       elif cmd == RemoteCmd.MMIO_WRITE:
         data = conn.recv(arg1, socket.MSG_WAITALL)
         if bar in self.bars and arg0 + arg1 <= len(self.bars[bar]): self.bars[bar][arg0:arg0+arg1] = data
       elif cmd == RemoteCmd.MAP_SYSMEM_FD:
-        if len(self.sysmem) >= self.max_sysmem: conn.sendall(resp(status=1)); continue
+        if len(self.sysmem) >= self.max_sysmem:
+          conn.sendall(resp(status=1))
+          continue
         size = max((arg0 + 0xfff) & ~0xfff, 0x4000)
         f = tempfile.TemporaryFile()
         os.ftruncate(f.fileno(), size)
