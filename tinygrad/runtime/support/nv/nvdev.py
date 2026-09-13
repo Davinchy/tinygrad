@@ -110,6 +110,7 @@ class NVDev:
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
+    if self.chip_id == 0xffffffff: raise RuntimeError(f"nv {self.devfmt}: mmio reads all ones: the device fell off the bus or the bar is not mapped")
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
     self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = {"GB2": "gb202", "AD1": "ad102", "GA1": "ga102"}[self.chip_name[:3]]

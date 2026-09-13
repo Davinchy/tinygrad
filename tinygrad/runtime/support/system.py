@@ -351,7 +351,7 @@ class RemotePCIDevice(PCIDevice):
   _bulk_recv:int = 0
   _rpc_count:int = 0
   _start_time:float = 0.0
-  timeout:float = getenv("REMOTE_TIMEOUT", 10.0) # a server that stops answering must fail the client, not join it
+  timeout:float = getenv("REMOTE_TIMEOUT", 60.0) # a server that stops answering must fail the client, not join it
 
   @staticmethod
   @functools.cache
