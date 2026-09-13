@@ -207,5 +207,30 @@ class TestRemotePCI(unittest.TestCase):
     self.assertEqual(self.dev.map_bar(0, fmt='I')[(0x1000 + 0x1234 * 4) // 4], 0xcafef00d)
     self.assertLess(self.server.ops.index(RemoteCmd.MMIO_WRITE), self.server.ops.index(RemoteCmd.MMIO_READ)) # the program wrote, then we read
 
+  def test_compiled_ring_store(self):
+    # the shape of a gpfifo ring store: a 64 bit entry at a runtime index into bar 1, the packet built by the same patch call apl_store uses
+    from tinygrad.runtime.support.hcq2 import ccall, patch, lower_call, hcq_link, HCQInfo
+    from tinygrad.engine.realize import lower_and_compile, run_linear
+    from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, KernelInfo
+    from tinygrad.runtime.autogen import libc
+    from tinygrad.device import Device
+    put = Buffer("CPU", 1, dtypes.uint64, initial_value=struct.pack('<Q', 0x10003)) # put_value: entry 3 of a 0x10000 ring
+    cpu, orig = Device["CPU"], Device["CPU"].pm_bufferize
+    cpu.pm_bufferize = PatternMatcher([(UPat(Ops.PARAM, tag="apl_put"), lambda ctx, b=put: b)]) + orig
+    self.addCleanup(setattr, cpu, "pm_bufferize", orig)
+    p = UOp.placeholder((1,), dtypes.uint64, device="CPU", volatile=True, tag="apl_put").index(0).load()
+    idx, entry = (p % 0x10000).cast(dtypes.int), UOp.const(0x1000000000, dtypes.uint64) + (p << 42) # a gpentry like NVQueue.submit's
+    hdr = struct.pack(REMOTE_REQ, RemoteCmd.MMIO_WRITE, 0, 1, 0x2000, 8, 0)
+    pkt = UOp.placeholder((len(hdr) + 8,), dtypes.uint8, device="CPU", volatile=True, tag="apl_ring")
+    pkt = patch(pkt, [(9, idx.cast(dtypes.uint64) * 8 + 0x2000), (len(hdr), entry)], hdr)
+    ret = UOp.placeholder((1,), dtypes.int64, device="CPU", tag="apl_ret")
+    written = ret.index(0).store(ccall(libc.write, self.dev.sock.fileno(), pkt.index(0), UOp.const(len(hdr) + 8, dtypes.uint64)))
+    call = UOp.sink(written, arg=KernelInfo("apl_ring")).call(aux=HCQInfo(("CPU",)))
+    linear = lower_and_compile(UOp(Ops.LINEAR, src=(unwrap(lower_call(call)),)))
+    run_linear(hcq_link(linear, allow_cache=False), jit=True, update_stats=False, wait=True)
+    ring = self.dev.map_bar(1, off=0x2000, size=0x10000 * 8, fmt='Q')
+    self.assertEqual(ring[3], 0x1000000000 + (0x10003 << 42))
+    self.assertEqual(ring[2], 0)
+
 if __name__ == "__main__":
   unittest.main()
