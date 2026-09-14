@@ -1,7 +1,7 @@
 from __future__ import annotations
 import collections, functools, dataclasses, enum, struct
 from typing import Any, ClassVar
-from tinygrad.helpers import round_up, getenv, to_mv
+from tinygrad.helpers import round_up, getenv, DEBUG, to_mv
 
 class MMIOInterface:
   def __init__(self, addr:int, nbytes:int, fmt='B'): self.mv, self.addr, self.nbytes, self.fmt = to_mv(addr, nbytes).cast(fmt), addr, nbytes, fmt
@@ -284,7 +284,14 @@ class MemoryManager:
     assert self.dev.is_booting == boot, "During booting, only boot memory can be allocated"
     allocator = self.boot_allocator if boot else (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator)
     paddr = allocator.alloc(round_up(size, 0x1000), align)
-    if zero: self.dev.vram[paddr:paddr+size] = bytes(size)
+    if zero: self.zero_vram(paddr, size)
     return paddr
+
+  def zero_vram(self, paddr:int, size:int):
+    # the cpu reaches vram only through the bar window, which on a small bar card covers the first 256 MB. a context buffer
+    # allocated after a model's weights sits above that and simply cannot be written from here: a remote drops the write on
+    # the floor and a local one would fault. rm initialises these buffers itself, so say so rather than pretend it happened.
+    if paddr + size <= self.dev.vram.nbytes: self.dev.vram[paddr:paddr+size] = bytes(size)
+    elif DEBUG >= 2: print(f"mm {self.dev.devfmt}: {size:#x} at {paddr:#x} is past the {self.dev.vram.nbytes:#x} byte bar window, not zeroed")
 
   def pfree(self, paddr:int, ptable=False): (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator).free(paddr)
